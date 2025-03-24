@@ -64,7 +64,7 @@ with st.sidebar:
     model_name = st.selectbox(
         "Select Model", 
         ["gpt2", "gpt2-medium", "gpt2-large"], 
-        index=0
+        index=2
     )
     temperature = st.slider("Temperature", min_value=0.1, max_value=1.0, value=0.7, step=0.1)
     max_length = st.slider("Max Response Length", min_value=50, max_value=500, value=150, step=50)
@@ -96,64 +96,81 @@ def generate_response(user_input, use_history=True):
     model = st.session_state.model
     tokenizer = st.session_state.tokenizer
     
-    # More explicit prompting with clear instructions
-    system_prompt = "You are a helpful AI assistant that provides accurate and informative answers to questions. Answer the following question in detail:"
+    # Add a BOS token if the tokenizer doesn't add it automatically
+    if not tokenizer.bos_token:
+        tokenizer.add_special_tokens({'bos_token': '<|startoftext|>'})
+        tokenizer.add_special_tokens({'eos_token': '<|endoftext|>'})
     
-    # Create a clear conversation format
-    if use_history and len(st.session_state.messages) > 0:
-        # Build context from recent messages (limit to prevent context overflow)
-        conversation = system_prompt + "\n\n"
-        for msg in st.session_state.messages[-4:]:
-            prefix = "Human: " if msg["role"] == "user" else "Assistant: "
-            conversation += f"{prefix}{msg['content']}\n"
+    # Simpler, more direct prompt that works better with GPT-2
+    if use_history and len(st.session_state.messages) > 2:  # Only use history if we have a meaningful conversation
+        # Format: Q: question A: answer Q: question A:
+        conversation = ""
+        for msg in st.session_state.messages[-4:]:  # Last 4 messages at most
+            prefix = "Q: " if msg["role"] == "user" else "A: "
+            conversation += f"{prefix}{msg['content']}\n\n"
         
-        # Add current question
-        conversation += f"Human: {user_input}\nAssistant:"
+        prompt = f"{conversation}Q: {user_input}\n\nA:"
     else:
-        conversation = f"{system_prompt}\n\nHuman: {user_input}\nAssistant:"
+        # Simple Q&A format works better for one-off questions with GPT-2
+        prompt = f"Q: {user_input}\n\nA:"
     
-    # Encode the conversation
+    # Encode prompt
     device = next(model.parameters()).device
-    input_ids = tokenizer.encode(conversation, return_tensors="pt").to(device)
+    inputs = tokenizer.encode(prompt, return_tensors="pt").to(device)
     
-    # Generate with more controlled parameters
-    attention_mask = torch.ones(input_ids.shape, device=device)
+    # Generate response with carefully chosen parameters
+    # Lower temperature for more focused responses
     with torch.no_grad():
-        output = model.generate(
-            input_ids,
-            attention_mask=attention_mask,
-            max_length=input_ids.shape[1] + max_length,
-            temperature=temperature,
+        outputs = model.generate(
+            inputs,
+            max_length=inputs.shape[1] + max_length,
+            temperature=0.6,  # Lower temperature for more factual responses
+            num_return_sequences=1,
+            no_repeat_ngram_size=2,
+            top_k=40,
             top_p=0.9,
-            top_k=50,
-            no_repeat_ngram_size=3,
             do_sample=True,
             pad_token_id=tokenizer.eos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            # Stop generation at "Human:" to prevent the model from continuing the conversation
-            bad_words_ids=[[tokenizer.encode("Human:", add_special_tokens=False)[0]]]
+            # Stop at "Q:" to prevent model continuing with new questions
+            bad_words_ids=[[tokenizer.encode("Q:", add_special_tokens=False)[0]]]
         )
     
-    # Decode the generated response
-    full_response = tokenizer.decode(output[0], skip_special_tokens=True)
+    # Decode response
+    full_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
     
-    # Extract only the assistant's part of the response
-    response_parts = full_response.split("Assistant:")
-    if len(response_parts) > 1:
-        # Get the last part after "Assistant:"
-        assistant_response = response_parts[-1].strip()
-        
-        # Clean up any parts that might contain "Human:" (end of response)
-        if "Human:" in assistant_response:
-            assistant_response = assistant_response.split("Human:")[0].strip()
-    else:
-        # Fallback if the format isn't as expected
-        assistant_response = full_response.replace(conversation, "").strip()
+    # Extract just the answer part
+    response = full_output.split("A:")[-1].strip()
     
-    # Additional cleanup
-    assistant_response = assistant_response.replace("<|endoftext|>", "").strip()
+    # Clean up the response
+    response = clean_response(response)
     
-    return assistant_response
+    return response
+
+def clean_response(text):
+    """Clean up the model's response to remove common artifacts."""
+    # Remove any JSON-like structures
+    if "{" in text and "}" in text:
+        text = text.split("{")[0].strip()
+    
+    # Remove numbered lists that aren't intentional
+    lines = text.split("\n")
+    cleaned_lines = []
+    for line in lines:
+        # Skip lines that are just numbers or common GPT-2 artifacts
+        if line.strip().isdigit() or line.strip() in ["<", "<<", ">", ">>", "..."]:
+            continue
+        cleaned_lines.append(line)
+    
+    text = "\n".join(cleaned_lines)
+    
+    # Remove any remaining special tokens
+    text = text.replace("<|endoftext|>", "").replace("<|startoftext|>", "")
+    
+    # If the response is too short or seems nonsensical
+    if len(text.split()) < 3:
+        text = "I don't have enough information to answer that question properly."
+    
+    return text.strip()
 # Display chat messages
 for message in st.session_state.messages:
     avatar = "🧑‍💻" if message["role"] == "user" else "🤖"
@@ -166,13 +183,47 @@ for message in st.session_state.messages:
         """, unsafe_allow_html=True)
 
 # Chat input
+# Chat input - fixed form handling
 with st.form(key="message_form", clear_on_submit=True):
     user_input = st.text_input("Your message:", key="user_input")
     submit_button = st.form_submit_button("Send")
     
     if submit_button and user_input:
-        # Add user message to chat history
+        # Add user message to chat history ONCE
         st.session_state.messages.append({"role": "user", "content": user_input})
+        
+        # Display user message
+        with st.container():
+            st.markdown(f"""
+            <div class="chat-message user">
+                <div class="avatar">🧑‍💻</div>
+                <div class="message">{user_input}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        # Show typing animation
+        with st.container():
+            typing_placeholder = st.empty()
+            typing_placeholder.markdown(f"""
+            <div class="chat-message bot">
+                <div class="avatar">🤖</div>
+                <div class="message">Thinking...</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+            # Generate and display bot response
+            bot_response = generate_response(user_input)
+            
+            # Replace typing animation with response
+            typing_placeholder.markdown(f"""
+            <div class="chat-message bot">
+                <div class="avatar">🤖</div>
+                <div class="message">{bot_response}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        # Add bot response to chat history
+        st.session_state.messages.append({"role": "bot", "content": bot_response})
         
 
 # Reset button

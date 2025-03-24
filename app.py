@@ -96,54 +96,64 @@ def generate_response(user_input, use_history=True):
     model = st.session_state.model
     tokenizer = st.session_state.tokenizer
     
-    # Get conversation history
-    conversation_history = st.session_state.conversation_history
+    # More explicit prompting with clear instructions
+    system_prompt = "You are a helpful AI assistant that provides accurate and informative answers to questions. Answer the following question in detail:"
     
-    # Define special tokens
-    bot_token = "<|bot|>:"
-    user_token = "<|user|>:"
-    
-    # Prepare prompt with history if needed
-    if use_history and conversation_history:
-        prompt = f"{conversation_history}\n{user_token} {user_input}\n{bot_token}"
+    # Create a clear conversation format
+    if use_history and len(st.session_state.messages) > 0:
+        # Build context from recent messages (limit to prevent context overflow)
+        conversation = system_prompt + "\n\n"
+        for msg in st.session_state.messages[-4:]:
+            prefix = "Human: " if msg["role"] == "user" else "Assistant: "
+            conversation += f"{prefix}{msg['content']}\n"
+        
+        # Add current question
+        conversation += f"Human: {user_input}\nAssistant:"
     else:
-        prompt = f"{user_token} {user_input}\n{bot_token}"
+        conversation = f"{system_prompt}\n\nHuman: {user_input}\nAssistant:"
     
-    # Encode prompt
+    # Encode the conversation
     device = next(model.parameters()).device
-    inputs = tokenizer.encode(prompt, return_tensors="pt").to(device)
+    input_ids = tokenizer.encode(conversation, return_tensors="pt").to(device)
     
-    # Generate response
+    # Generate with more controlled parameters
+    attention_mask = torch.ones(input_ids.shape, device=device)
     with torch.no_grad():
-        outputs = model.generate(
-            inputs,
-            max_length=inputs.shape[1] + max_length,
+        output = model.generate(
+            input_ids,
+            attention_mask=attention_mask,
+            max_length=input_ids.shape[1] + max_length,
             temperature=temperature,
-            num_return_sequences=1,
-            no_repeat_ngram_size=2,
+            top_p=0.9,
             top_k=50,
-            top_p=0.95,
+            no_repeat_ngram_size=3,
+            do_sample=True,
             pad_token_id=tokenizer.eos_token_id,
-            do_sample=True
+            eos_token_id=tokenizer.eos_token_id,
+            # Stop generation at "Human:" to prevent the model from continuing the conversation
+            bad_words_ids=[[tokenizer.encode("Human:", add_special_tokens=False)[0]]]
         )
     
-    # Decode response
-    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    # Decode the generated response
+    full_response = tokenizer.decode(output[0], skip_special_tokens=True)
     
-    # Extract just the bot's response
-    response = generated_text[len(prompt):].strip()
-    
-    # Update conversation history
-    if use_history:
-        st.session_state.conversation_history = f"{prompt} {response}"
+    # Extract only the assistant's part of the response
+    response_parts = full_response.split("Assistant:")
+    if len(response_parts) > 1:
+        # Get the last part after "Assistant:"
+        assistant_response = response_parts[-1].strip()
         
-        # Limit conversation history
-        if len(st.session_state.conversation_history.split()) > 1024:
-            history_parts = st.session_state.conversation_history.split(f"\n{user_token}")
-            st.session_state.conversation_history = f"\n{user_token}".join(history_parts[-3:])
+        # Clean up any parts that might contain "Human:" (end of response)
+        if "Human:" in assistant_response:
+            assistant_response = assistant_response.split("Human:")[0].strip()
+    else:
+        # Fallback if the format isn't as expected
+        assistant_response = full_response.replace(conversation, "").strip()
     
-    return response
-
+    # Additional cleanup
+    assistant_response = assistant_response.replace("<|endoftext|>", "").strip()
+    
+    return assistant_response
 # Display chat messages
 for message in st.session_state.messages:
     avatar = "🧑‍💻" if message["role"] == "user" else "🤖"
@@ -156,7 +166,14 @@ for message in st.session_state.messages:
         """, unsafe_allow_html=True)
 
 # Chat input
-user_input = st.text_input("Your message:", key="user_input")
+with st.form(key="message_form", clear_on_submit=True):
+    user_input = st.text_input("Your message:", key="user_input")
+    submit_button = st.form_submit_button("Send")
+    
+    if submit_button and user_input:
+        # Add user message to chat history
+        st.session_state.messages.append({"role": "user", "content": user_input})
+        
 
 # Reset button
 if st.sidebar.button("Reset Conversation"):
@@ -201,6 +218,3 @@ if user_input:
     
     # Add bot response to chat history
     st.session_state.messages.append({"role": "bot", "content": bot_response})
-    
-    # Clear the input box
-    st.session_state.user_input = ""

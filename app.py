@@ -226,7 +226,6 @@ with st.form(key="message_form", clear_on_submit=True):
         st.session_state.messages.append({"role": "bot", "content": bot_response})
         
 # Reset button
-if st.sidebar.button("Reset Conversation"):
     st.session_state.messages = []
     st.session_state.conversation_history = ""
     try:

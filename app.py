@@ -225,12 +225,15 @@ with st.form(key="message_form", clear_on_submit=True):
         # Add bot response to chat history
         st.session_state.messages.append({"role": "bot", "content": bot_response})
         
-
 # Reset button
 if st.sidebar.button("Reset Conversation"):
     st.session_state.messages = []
     st.session_state.conversation_history = ""
-    st.experimental_rerun()
+    try:
+        st.experimental_rerun()
+    except AttributeError:
+        st.warning("App rerun functionality is not available. Please reload the page manually.")
+
 
 # When user submits a message
 if user_input:
